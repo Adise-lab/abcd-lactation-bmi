@@ -1,0 +1,1750 @@
+---
+title: "BF BMI"
+author: "J Ottino Gonzalez"
+format: 
+  ipynb: default
+editor: visual
+---
+
+#1. PREPARATION
+
+## Set path and load libraries
+
+```{R}
+
+pacman::p_load(tidyverse, data.table, lmerTest, ggeffects, summarytools, ggpubr)
+
+options(scipen = 999) # turn sci-notation off
+
+drive.dir <-  '/Users/jongonzalez/Library/CloudStorage/GoogleDrive-jonatanottino@gmail.com/.shortcut-targets-by-id/1-H3wnyMZIfSE18QmegCkCkmyQpjcPqtZ/Adise_lab/Lab_member_files/Jonatan_files/'
+
+abcd.dir <- '/Users/jongonzalez/Desktop/abcd.nosync/ABCD_data/ABCD5.1/core/'
+
+quarto.dir <- "/Applications/RStudio.app/Contents/Resources/app/quarto/bin/quarto"
+
+setwd(paste0(drive.dir, 'projects/ABCD_brestfeeding_BMI/'))
+
+```
+
+## Medications out -- list participants taking meds impacting their weight at any timepoint
+
+```{R}
+
+visits <- c('baseline_year_1_arm_1', '1_year_follow_up_y_arm_1', '2_year_follow_up_y_arm_1')        # select eventnames of interest to load
+
+abcd_meds <- read.csv(paste0(abcd.dir, '/physical-health/ph_p_meds.csv')) %>%    # load ABCD medication table
+  filter(eventname %in% visits)
+
+exclusion_meds <- readxl::read_xlsx(paste0(abcd.dir, 'all_ABCD_medications.xlsx'))   # list made by Victoria and shared by Miguel
+
+# Extract the medications codes
+exclusion_meds$code <- sub("([0-9]+)\\s.*", "\\1", exclusion_meds$medication)
+
+excluded_codes <- exclusion_meds$code      # store medication codes aside
+
+# Check columns with rxnorm_p to identify subjects taking that meds
+med_columns <- grep("med\\d+_rxnorm_p", names(abcd_meds), value = TRUE)
+
+# append is_excluded variable based on whether any of the excluded codes are within the med_columns
+abcd_meds <- abcd_meds %>%
+  mutate(is_excluded = apply(.[, med_columns], 1, function(row) {
+    any(substr(row, 1, regexpr(" ", row, fixed = TRUE) - 1) %in% excluded_codes, na.rm = TRUE)
+  }))
+
+# Extract excluded subjects, save a list and exclude them in df
+subjs_to_exclude_meds <- abcd_meds %>%
+  filter(is_excluded == 1) %>%
+  select(src_subject_id) %>% 
+  pull() %>% 
+  unique()
+
+cat("Subjects taking meds exclusionary: ", length(subjs_to_exclude_meds), "\n")  
+
+```
+
+## Anthropometric measurement errors out -- List subjects with anthropometric errors and exclusion criteria (BMIpct \< 5)
+
+```{R}
+
+bmi.qc <- fread(paste0(drive.dir, 'general_scripts/jonatan_bmi_check_2025-01-16.csv'))
+
+cat("Subjects with bad height at bas: ", length(bas <- bmi.qc %>% filter(remove == 'drop bas') %>% pull(src_subject_id)), '\n')
+
+cat("Subjects with bad height at y1: ", length(y1 <- bmi.qc %>% filter(remove == 'drop y1') %>% pull(src_subject_id)), '\n')
+
+cat("Subjects with bad height at y2 or visit during covid or remote: ", length(y2 <- bmi.qc %>% filter(remove == 'drop y2') %>% pull(src_subject_id)), '\n')
+
+cat("Subjects with bad height at bas y1: ", length(basy1 <- bmi.qc %>% filter(remove == 'drop bas y1') %>% pull(src_subject_id)), '\n')
+
+cat("Subjects with bad height at bas y2: ", length(basy2 <- bmi.qc %>% filter(remove == 'drop bas y2') %>% pull(src_subject_id)), '\n')
+
+cat("Subjects with bad height at y1 y2: ", length(y1y2 <- bmi.qc %>% filter(remove == 'drop y1 y2') %>% pull(src_subject_id)), '\n')
+
+cat("Subjects with bad height at all: ", length(all <- bmi.qc %>% filter(remove == 'drop all') %>% pull(src_subject_id)), '\n')
+
+cat("Subjects with excessive weight-loss bas to y1: ", length(wl1 <- bmi.qc %>% filter(lostwg_y0_y1 == 'flag') %>% pull(src_subject_id)), '\n')
+
+cat("Subjects with excessive weight-loss y1 to y2: ", length(wl2 <- bmi.qc %>% filter(lostwg_y1_y2 == 'flag') %>% pull(src_subject_id)), '\n')
+
+bmi.qced <- fread(paste0(abcd.dir, 'physical-health/bmi_converted_5.0.csv')) %>% 
+  # keep only visits we are interested
+  filter(eventname %in% visits) %>%                         
+  mutate(eventname = factor(eventname, levels = c('baseline_year_1_arm_1',
+                                                  '1_year_follow_up_y_arm_1',
+                                                  '2_year_follow_up_y_arm_1'), ordered = T)) %>% 
+  droplevels() %>% 
+  select(src_subject_id, eventname, height, weight, bmi, bmipct) %>% 
+  filter(!src_subject_id %in% c(all, wl1, wl2)) %>% 
+  mutate(bmi = ifelse(eventname == 'baseline_year_1_arm_1' & src_subject_id %in% c(bas, basy1, basy2), NA, 
+                      ifelse(eventname == '1_year_follow_up_y_arm_1' & src_subject_id %in% c(y1, basy1, y1y2), NA,
+                             ifelse(eventname == '2_year_follow_up_y_arm_1' & src_subject_id %in% c(y2, basy2, y1y2), NA, bmi)))) %>% 
+  mutate(across(where(is.numeric), ~round(., 2))) 
+
+bmi.qced %>% 
+  group_by(eventname) %>% 
+  summarize(n = sum(is.na(bmi)))
+
+# Apply extra criteria for analysis
+
+cat('Subjects with bmipct lower than 5: ', length(a <- bmi.qced %>% filter(bmipct < 5) %>% pull(src_subject_id) %>% unique()), '\n')
+
+cat('Subjects with height lower than 110 cm: ', length(b <- bmi.qced %>% filter(height < 110) %>% pull(src_subject_id) %>% unique()), '\n')
+
+cat('Subjects with weight lower than 15 kg: ', length(c <- bmi.qced %>% filter(weight < 15) %>% pull(src_subject_id) %>% unique()), '\n')
+
+# Create a dataframe with qc'ed BMI data ready to append in future steps
+
+bmi.qced <- bmi.qced %>% 
+  filter(bmipct >= 5,
+         height >= 110,
+         weight >= 15) %>% 
+  drop_na()
+
+bmi.qced %>% 
+  group_by(eventname) %>% 
+  count()
+
+```
+
+## Load the demographic data without subjects flagged at previous steps
+
+```{R}
+
+system(paste(quarto.dir, 'render', paste0(drive.dir, 'general_scripts/ABCD_demo/ABCD_demo.qmd')))   # this runs the demo_script.qmd 
+
+df.demo <- readRDS(paste0(drive.dir, 'general_scripts/ABCD_demo/df.demo.rds')) %>%                  # this loads the output of the demo_script.qmd stored in drive.dir
+  filter(eventname %in% visits &
+           !src_subject_id %in% subjs_to_exclude_meds) %>%            
+  mutate(max_education_category = factor(ifelse(max_education_category == 'Do not know', NA, 
+                                                ifelse(max_education_category == '>HS', '<HS',max_education_category)),
+                                         levels = c('<HS', 'HS/GED', 'Some college', 'Bachelor', 'Postgrad'), ordered = T),
+         child_sex = factor(ifelse(child_sex == 'Intersex', NA, 
+                                   ifelse(child_sex == 'Female', 'Female', 'Male')))) %>% 
+  droplevels()
+
+df.demo %>% 
+  group_by(eventname) %>% 
+  count()
+  
+df.demo <- df.demo %>% 
+  left_join(., bmi.qced, by = c('src_subject_id', 'eventname'))
+
+df.demo %>%                      
+  group_by(eventname) %>% 
+  count()
+
+```
+
+## Make sure you do not have missing data for mandatory data (in 'not.missing' vector)
+
+```{R}
+
+not.missing <- c('age_mos', 'child_sex', 'visit_type', 'max_education_category', 'pds', 'bmi')   # these variables CANNOT be missing
+
+count_missing_function <- function(data, vars) {
+  data_subset <- data[, vars, drop = F]
+  sapply(data_subset, function(x) sum(is.na(x)))
+}
+
+df.split <- split(df.demo, df.demo$eventname)   # separate df.demo by eventname (dataframe 1 = baseline, dataframe 2 = follow-up, ...)
+
+(missing_counts_by_visit <- lapply(df.split, count_missing_function, vars = not.missing))     # run to print the variables from 'not.missing' with NA counts
+ 
+df.demo %>%                          # before removing NAs
+  group_by(eventname) %>% 
+  count()
+
+df.demo <- df.demo %>%                                         # update df.demo with no missing data in 'not.missing' variables
+  filter(if_all(all_of(not.missing), ~!is.na(.)))
+
+sum(is.na(df.demo[, not.missing, drop = F]))    # is there any NA for the variables you just filter NAs out? should be 0
+
+df.demo %>%                        # after removing NAs
+  group_by(eventname) %>% 
+  count()
+
+df <- df.demo %>%                
+    # make sure to 999 all NAs in unimportant values so you don't drop these people later EXCEPT the ones listed below (are not mandatory)
+   mutate(across(!all_of(c(not.missing, 'eventname', 'visit_type', 'interview_date', 'handedness', 'race', 'race_factor', 'ethnicity', 'income', 'pds_male_y', 'pds_male_p', 'pds_female_y', 'pds_female_p')), ~ifelse(is.na(.), 999, .)))
+  
+df %>% 
+  group_by(eventname) %>% 
+  count()
+
+```
+
+## Append puberty 
+
+```{R}
+
+df2 <- df %>% 
+  mutate(puberty = factor(case_when(pds < 2 ~ 'pre puberty',
+                                    pds < 3 ~ 'early puberty',
+                                    pds < 4 ~ 'mid puberty',
+                                    pds < 5 ~ 'late puberty',
+                                    TRUE ~ 'post puberty'), 
+                          levels = c('pre puberty', 'early puberty', 'mid puberty', 'late puberty', 'post puberty'))) %>%
+  drop_na(puberty) %>% 
+  droplevels()
+
+df2 %>% 
+  group_by(eventname) %>% 
+  count()
+
+```
+
+## Load breastfeeding reports at baseline and cross-reference with y3 data -- Also remove those exposed to drugs (after knowing of pregnancy), excessive prematurity (\<28wk) and very low birthweight (\<1200gr)
+
+```{R}
+
+drugs.before <- c('devhx_8_alcohol', 'devhx_8_tobacco', 'devhx_8_marijuana', 'devhx_8_oxycont', 'devhx_8_her_morph', 'devhx_8_coc_crack')
+
+drugs.after <- c('devhx_9_alcohol', 'devhx_9_tobacco', 'devhx_9_marijuana', 'devhx_9_oxycont', 'devhx_9_her_morph', 'devhx_9_coc_crack')
+
+bf <- fread(paste0(abcd.dir, 'physical-health/ph_p_dhx.csv')) %>%
+  mutate(weight_kg1 = birth_weight_lbs * 453.6, 
+         weight_kg2 = birth_weight_oz * 28.35,  
+         mode_of_delivery = factor(ifelse(devhx_13_3_p == 1, 'Cesarean', ifelse(devhx_13_3_p == 0, 'Vaginal', 'Do not know'))),  
+         pregnancy_complications = as.factor(ifelse(between(rowSums(select(., c(devhx_10a3_p:devhx_10l3_p))), 1, 12), 1,
+                                                                 ifelse(rowSums(select(., c(devhx_10a3_p:devhx_10l3_p))) == 0, 0, 999))),  # if ANY complication during pregnancy, 1; na.rm = T bc if they have NA in a few it doesn't matter
+         birth_complications = as.factor(ifelse(between(rowSums(select(., c(devhx_14a3_p:devhx_14g3_p))), 1, 7), 1, 
+                                                                 ifelse(rowSums(select(., c(devhx_14a3_p:devhx_14g3_p))) == 0, 0, 999))),    # if ANY complication during birth, 1; na.rm = T bc if they have NA in a few it doesn't matter
+         birthweight_gr = ifelse(!is.na(weight_kg1) & !is.na(weight_kg2), weight_kg1 + weight_kg2, ifelse(!is.na(weight_kg1) & is.na(weight_kg2), weight_kg1, NA)),
+         devhx_12_p = ifelse(devhx_12a_p == 0 & is.na(devhx_12_p), 0, ifelse(devhx_12a_p == 0  & devhx_12_p == 999, NA, devhx_12_p))) %>% 
+  filter(eventname == 'baseline_year_1_arm_1')  %>%             # keep less than 12wk premature
+  # transform breastfeeding y0 report (months) into the same scale as y3 for cross-referencing
+  mutate(bfq_duration_y0 = case_when(devhx_18_p == 0 ~ 0,                 # 0 months
+                                      # 1 at year 3 is reserved to 'Several days' (1 = Several days) which has no direct translation here
+                                     between(devhx_18_p, 1, 3) ~ 2,        # 2 = 1 to 3 months 
+                                     between(devhx_18_p, 4, 6) ~ 3,        # 3 = 4 to 6 months
+                                     between(devhx_18_p, 7, 9) ~ 4,        # 4 = 7 to 9 months
+                                     between(devhx_18_p, 10, 12) ~ 5,      # 5 = 10 to 12 months
+                                     between(devhx_18_p, 13, 18) ~ 6,      # 6 = 13 to 18 months
+                                     between(devhx_18_p, 19, 24) ~ 7,      # 7 = 19 to 24 months
+                                     devhx_18_p > 24 ~ 8,                  # 8 = > 24 months
+                                     TRUE ~ NA)) %>% 
+  select(src_subject_id, eventname, bfq_duration_y0, devhx_1_p, all_of(c(drugs.before, drugs.after)), mode_of_delivery, pregnancy_complications, birth_complications, birthweight_gr, devhx_12_p, devhx_18_p) %>%
+  # select(src_subject_id, eventname, bfq_duration_y0, devhx_1_p, all_of(c(drugs.before, drugs.after)), birthweight_gr, devhx_12_p, devhx_18_p) %>% 
+  left_join(., fread(paste0(abcd.dir, 'physical-health/ph_p_bfq.csv')) %>% 
+               rename(bfq_duration_y3 = bfq_breastfeed_time_p) %>% 
+               select(src_subject_id, bfq_duration_y3), by = 'src_subject_id') %>% 
+  # if y0 is not missing and y3 is, replace by y0; if y0 is missing and y3 is not, replace by y3
+  mutate(bfq_duration_y3 = ifelse(!is.na(bfq_duration_y0) & is.na(bfq_duration_y3) | bfq_duration_y3 == 999, bfq_duration_y0, bfq_duration_y3),
+         bfq_duration_y0 = ifelse(is.na(bfq_duration_y0) & !is.na(bfq_duration_y3), bfq_duration_y3, bfq_duration_y0)) %>%
+    rowwise() %>%
+    mutate(
+    flag = any(mapply(
+      function(before, after) {
+        before_val <- get(before)
+        after_val <- get(after)
+        # Check both conditions
+        (before_val == 1 && (is.na(after_val) || after_val %in% c(1, 999))) ||
+          ((is.na(before_val) || before_val == 999) && (is.na(after_val) || after_val %in% c(1, 999)))
+      },
+      drugs.before,
+      drugs.after
+    ))
+  ) %>%
+    ungroup() %>% 
+    mutate(keep_bf =  ifelse(!is.na(bfq_duration_y0) & !is.na(bfq_duration_y3), 
+                             ifelse(bfq_duration_y0 == 0 & bfq_duration_y3 == 0, 'keep',
+                                    ifelse(bfq_duration_y0 > 0 & bfq_duration_y3 > 0 & abs(bfq_duration_y0 - bfq_duration_y3) <= 1, 'keep', 'lose')),
+                             'lose'),
+         keep_mom = ifelse(devhx_1_p == 1, 'keep', 'lose'),
+         keep_drugs = ifelse(flag == 'FALSE', 'keep', 'lose'),
+         keep_bw = ifelse(birthweight_gr > 1200, 'keep', 'lose'),
+         keep_pr = ifelse(devhx_12_p < 12, 'keep', 'lose'),
+         eventname = factor(eventname, levels = c('baseline_year_1_arm_1', 
+                                                  '1_year_follow_up_y_arm_1', 
+                                                  '2_year_follow_up_y_arm_1',
+                                                  '3_year_follow_up_y_arm_1'), ordered = T)) %>% 
+  filter(src_subject_id %in% df$src_subject_id)
+
+cat("Subjects with inconsistent breastfeeding: ", length(bf %>% filter(keep_bf == 'lose') %>% pull(src_subject_id)), "\n")
+
+cat("Subjects with non-biological mother: ", length(bf %>% filter(keep_mom == 'lose') %>% pull(src_subject_id)), "\n")
+
+cat("Subjects with drugs use after knowing pregnancy: ", length(bf %>% filter(keep_drugs == 'lose') %>% pull(src_subject_id)), "\n")
+
+cat("Subjects with low birth weight: ", length(bf %>% filter(keep_bw == 'lose') %>% pull(src_subject_id)), "\n")
+
+cat("Subjects with extreme prematurity (28 weeks or less): ", length(bf %>% filter(keep_pr == 'lose') %>% pull(src_subject_id)), "\n")
+
+# update df2
+
+df2 <- df2 %>% 
+  inner_join(., bf %>% 
+               filter(keep_bf == 'keep' &
+                      keep_mom == 'keep' &
+                      keep_drugs == 'keep' &
+                      keep_bw == 'keep' &
+                      keep_pr == 'keep') %>%
+               mutate(bfq_duration = case_when(bfq_duration_y0 == 0 ~ 0,                # 0 means no breastfeeding
+                                               between(bfq_duration_y0, 2, 3) ~ 1,      # 1 means 1-6 months breastfeeding (1-3 and 4-6 months according to year 3)
+                                               between(bfq_duration_y0, 4, 5) ~ 2,      # 2 means 7-12 months (7-9 and 10-12 months according to year 3)
+                                               bfq_duration_y0 > 5 ~ 3,
+                                               TRUE ~ 999)) %>%            # 3 means > 12 months
+               select(src_subject_id, mode_of_delivery, pregnancy_complications, birth_complications, bfq_duration, bfq_duration_y0, birthweight_gr, devhx_12_p), by = 'src_subject_id') %>%
+  filter(bfq_duration != 999) # 999 are equal to bfq_duration_y3 == 1 that is Several days and were map to bfq_duration_y0 because it was missing
+  
+df2 %>% 
+  group_by(eventname) %>% 
+  count()
+
+```
+
+## Drop those with unhealthy weight at baseline
+
+```{R}
+
+subjs_to_exclude_bmi <- df2 %>% 
+    mutate(drop = ifelse(bmipct >= 85 & eventname == 'baseline_year_1_arm_1', 'drop', 'keep')) %>%
+    filter(drop == 'drop') %>%
+    pull(src_subject_id) %>%
+    unique()
+
+df3 <- df2 %>%
+  filter(!src_subject_id %in% subjs_to_exclude_bmi) %>%
+  mutate(bmi_group = ifelse(bmipct >= 85, 'unhealthy', 'healthy'))
+
+df3 %>%
+  group_by(eventname, bmi_group) %>%   # check if done correctly
+  count()
+
+```
+
+## Make sure now you have a good distribution across sexes, pubertal stages, and bmi groups for site before dropping siblings -- there are barely participants in site 22!! also there's barely post-pubertal individuals
+
+```{R}
+
+df3 %>% 
+  mutate(puberty = factor(case_when(pds < 2 ~ 'pre-puberty',
+                                    pds < 3 ~ 'early puberty',
+                                    pds < 4 ~ 'mid puberty',
+                                    pds < 5 ~ 'late puberty',
+                                    TRUE ~ 'post puberty'), 
+         levels = c('pre-puberty', 'early puberty', 'mid puberty', 'late puberty', 'post puberty'))) %>% 
+  select(puberty, site, child_sex) %>% 
+  table()
+
+df3 %>% 
+  mutate(puberty = factor(case_when(pds < 2 ~ 'pre-puberty',
+                                    pds < 3 ~ 'early puberty',
+                                    pds < 4 ~ 'mid puberty',
+                                    pds < 5 ~ 'late puberty',
+                                    TRUE ~ 'post puberty'), 
+         levels = c('pre-puberty', 'early puberty', 'mid puberty', 'late puberty', 'post puberty'))) %>% 
+  select(bmi_group, site, child_sex) %>% 
+  table()
+
+df3 %>% 
+  mutate(puberty = factor(case_when(pds < 2 ~'pre-puberty',
+                                    pds < 3 ~ 'early puberty',
+                                    pds < 4 ~ 'mid puberty',
+                                    pds < 5 ~ 'late puberty',
+                                    TRUE ~ 'post puberty'), 
+         levels = c('pre-puberty', 'early puberty', 'mid puberty', 'late puberty', 'post puberty')), 
+         site = ifelse(site == 'site22', NA, site)) %>% 
+  select(puberty, site) %>% 
+  drop_na() %>% 
+  droplevels() %>% 
+  table()
+
+df4 <- df3 %>% 
+  mutate(puberty = factor(case_when(pds < 2 ~ 'pre puberty',
+                                    pds < 3 ~ 'early puberty',
+                                    pds < 4 ~ 'mid puberty',
+                                    pds < 5 ~ 'late puberty',
+                                    TRUE ~ NA),                                                
+         levels = c('pre puberty', 'early puberty', 'mid puberty', 'late puberty', NA)),       # getting rid of past puberty
+         site = ifelse(site == 'site22', NA, site)) %>%                                        # getting rid of site 22
+  drop_na(puberty, site) %>% 
+  droplevels()
+
+df4 %>% 
+  select(site, child_sex) %>% 
+  table()
+
+```
+
+## Keep only participants with baseline + y1, baseline + y2 and baseline + y1/y2 data.
+
+```{R}
+
+df5 <- df4 %>% 
+  group_by(src_subject_id) %>%
+  filter(any(eventname == 'baseline_year_1_arm_1')) %>%  # Ensure baseline is present
+  filter(all(eventname %in% visits)) %>%                 # Allow only baseline, year1, year2
+  ungroup()
+
+df5 %>%
+  group_by(src_subject_id) %>%
+  summarize(has_baseline = any(eventname == "baseline_year_1_arm_1")) %>%    
+  filter(!has_baseline) %>%                              # count how many do not have baseline
+  count()
+
+df5 %>% 
+  group_by(eventname, bmi_group) %>% 
+  count()
+
+```
+
+## Now keep one random sibling per family -- prioritize those with the more amount of visits and data
+
+```{R}
+
+(thr <- length(visits))
+
+set.seed(291104)       
+
+unique_participants <- df5 %>% 
+  # Determine the number of unique time points for each participant
+  group_by(src_subject_id, family_id) %>%
+  summarise(time_points = n_distinct(eventname), .groups = "drop") %>%
+  # Flag participants with both baseline and follow-up data
+  mutate(has_all = ifelse(time_points == thr, 1, 0)) %>%
+  # Group participants by family
+  group_by(family_id) %>%
+  # Prioritize: randomly select one from those with both time points if available
+  filter(has_all == max(has_all)) %>%
+  slice_sample(n = 1) %>%
+  ungroup() %>%
+  pull(src_subject_id)
+
+length(df5$src_subject_id[df5$eventname == 'baseline_year_1_arm_1']) - length(unique_participants)    # number of discarded
+
+length(unique_participants)   # number of unique participants (of 5,101)
+
+df6 <- df5 %>% 
+  filter(src_subject_id %in% unique_participants)
+
+# confirmation
+df6 %>%         
+  group_by(family_id) %>%
+  summarize(count = n()) %>%
+  ungroup() %>% 
+  filter(count > thr) %>% 
+  nrow()                        # this should result in 0; no participants with > thr rel_family_id (no siblings)
+
+df6 %>% 
+  group_by(eventname) %>% 
+  count()
+
+```
+
+#2. SUMMARY OF DEMOGRAPHICS
+
+```{R}
+
+vtable::st((table1 <- df6 %>% 
+             # filter(eventname == 'baseline_year_1_arm_1') %>%
+             mutate(pregnancy_complications = factor(ifelse(pregnancy_complications == 1, 'Yes', 
+                                                            ifelse(pregnancy_complications == 0, 'No', 'Do not know')),
+                                                     levels = c('Yes', 'No', 'Do not know')),
+                    birth_complications = factor(ifelse(birth_complications == 1, 'Yes', 
+                                                            ifelse(birth_complications == 0, 'No', 'Do not know')),
+                                                     levels = c('Yes', 'No', 'Do not know')),
+                    bfq_duration = factor(case_when(bfq_duration == 0 ~ 'no breastfed',              
+                                                    bfq_duration == 1 ~ '<6 months', 
+                                                    bfq_duration >= 2 ~ '>6 months'),
+                                          levels = c('no breastfed', '<6 months', '>6 months')), 
+                    bf_yes_no = factor(ifelse(bfq_duration == 'no breastfed', 'Not breastfed (only formula)', 'Breastfed'), 
+                                       levels = c('Breastfed', 'Not breastfed (only formula)')),
+                    mode_of_delivery = factor(mode_of_delivery, 
+                                              levels = c('Vaginal', 'Cesarean', 'Do not know')),
+                    devhx_12_p = ifelse(is.na(devhx_12_p), 0, devhx_12_p),
+                    term = factor(case_when(between(devhx_12_p, 0, 1) ~ 'Full-term',
+                                            between(devhx_12_p, 2, 3) ~ 'Early-term',
+                                            between(devhx_12_p, 4, 6) ~ 'Moderate-to-late preterm',
+                                            between(devhx_12_p, 7, 11) ~ 'Very preterm',
+                                            TRUE ~ NA)),
+                    preterm = factor(case_when(term %in% c('Full-term', 'Early-term') ~ 'On-term',
+                                               term %in% c('Moderate-to-late preterm', 'Very preterm') ~ 'Early-term',
+                                               TRUE ~ NA), levels = c('On-term', 'Early-term')),
+                    puberty2 = factor(case_when(pds < 2 ~ 'pre puberty',
+                                               pds > 2 ~ 'puberty',
+                                               TRUE ~ NA), levels = c('pre puberty', 'puberty', NA)),
+                    puberty = factor(case_when(pds < 2 ~ 'pre puberty',
+                                               pds < 3 ~ 'early puberty',
+                                               pds < 4 ~ 'mid puberty',
+                                               pds < 5 ~ 'late puberty',
+                                               TRUE ~ NA), levels = c('pre puberty', 'early puberty', 'mid puberty', 'late puberty', NA)),
+                    income = factor(case_when(income == 'Do not know' |
+                                                income == 'Refuse to answer' ~ 'Do not know/Refused to answer',
+                                              TRUE ~ income), levels = c('<50,000$', '50,000$-100,000$', '>100,000$', 'Do not know/Refused to answer')),
+                    race_factor = factor(case_when(race_factor == 'Do not know' |
+                                                     race_factor == 'Refuse to answer' ~ 'Do not know/Refused to answer',
+                                                   race_factor == 'Mixed' |
+                                                     race_factor == 'Other race' ~ 'Mixed/Other',
+                                                   TRUE ~ race_factor), levels = c('Asian', 'Black', 'Mixed/Other', 'NHPI/AINA', 'White', 'Do not know/Refused to answer')),
+                    ethnicity = factor(case_when(ethnicity %in% c('Do not know', 'Refuse to answer') ~ 'Do not know/answer',
+                                                 TRUE ~ ethnicity), levels = c ('Hispanic', 'Non-hispanic', 'Do not know/answer')),
+                    bmi_group = factor(case_when(bmipct >= 95 ~ 'Obesity', 
+                                             between(bmipct, 85, 94.9) ~ 'Overweight', 
+                                             TRUE ~ 'Healthy-weight'), levels = c('Healthy-weight', 'Overweight', 'Obesity')),
+                    birthweight_gr = birthweight_gr/1000) %>% 
+             rename(weeks_premature = devhx_12_p)),
+           vars = c('age_mos', 'child_sex', 'puberty2', 'pds_report', 'birthweight_gr', 'preterm', 'weeks_premature',
+                    'mode_of_delivery', 'pregnancy_complications', 'birth_complications',
+                    'race_factor', 'ethnicity', 'max_education_category', 'income', 'bf_yes_no',
+                    'bfq_duration', 'bmi', 'bmipct', 'bmi_group'),
+           digits = 3,
+           group = 'eventname')
+
+```
+
+## Tables for group comparisons
+
+```{R}
+
+library(tableone)
+
+cont.vars <- c('age_mos', 'pds', 'birthweight_gr', 'weeks_premature', 'bmi', 'bmipct')
+
+cat.vars <- c('child_sex', 'puberty2', 'preterm', 'mode_of_delivery', 'pregnancy_complications',
+              'birth_complications', 'race_factor', 'ethnicity', 'max_education_category', 'income')#, 'bmi_group')
+
+table1.bas <- table1 %>%
+  # filter(eventname == 'baseline_year_1_arm_1') %>%
+  # filter(eventname == '1_year_follow_up_y_arm_1') %>%
+  filter(eventname == '2_year_follow_up_y_arm_1') %>%
+  mutate(across(cont.vars, as.numeric)) %>%
+  mutate(across(cat.vars, as.factor)) %>%
+  select(bf_yes_no, bfq_duration, eventname, all_of(c(cont.vars, cat.vars)))
+
+table1.comp <- tableone::CreateTableOne(vars = c(cont.vars, cat.vars),
+                                        strata = c('bf_yes_no'),
+                                        data = table1.bas)
+
+print(table1.comp, test = TRUE)
+
+# t_stats <- sapply(cont.vars, function(var) {
+#   t_test_result <- t.test(table1.bas[[var]] ~ table1.bas$bf_yes_no)
+#   return(t_test_result$statistic)
+# })
+# 
+# t_stats
+
+aov_stats <- sapply(cont.vars, function(var) {
+  aov_test_result <- aov(table1.bas[[var]] ~ bfq_duration, data = table1.bas)
+  summary_result <- summary(aov_test_result)
+  return(summary_result[[1]]$"F value"[1])  # Extract F-statistic
+})
+
+aov_stats
+
+q_stats <- sapply(cat.vars, function(var) {
+  q_test_result <- chisq.test(table1.bas[[var]], table1.bas$bfq_duration)
+  return(q_test_result$statistic)
+})
+
+q_stats
+
+(table1_df <- print(table1.comp, showAllLevels = T, quote = T, noSpaces = T))
+
+write.csv(as.data.frame(table1_df), "~/Desktop/table1.csv")
+
+```
+
+#3. PRE-ANALYSIS: Recoding and assumptions
+
+```{R}
+
+df.analysis <- df6 %>% 
+  mutate(bmi_group = as.factor(bmi_group),
+         mode_of_delivery = as.factor(ifelse(mode_of_delivery == 'Do not know', NA, mode_of_delivery)),
+         birth_complications = as.factor(ifelse(birth_complications == 999, NA, birth_complications)),
+         pregnancy_complications = as.factor(ifelse(pregnancy_complications == 999, NA, pregnancy_complications)),
+         preterm_yes_no = as.factor(ifelse(is.na(devhx_12_p) | between(devhx_12_p, 0, 3), 'no', 'yes')),
+         puberty_yes_no = as.factor(ifelse(pds < 2, 'no', 'yes')),
+         weeks_premature = devhx_12_p,
+         child_sex = as.factor(child_sex),
+         pds_report = as.factor(pds_report),
+         bf_yes_no = factor(ifelse(bfq_duration == 0, 'Not breastfed (only formula)', 'Breastfed'), levels = c('Breastfed', 'Not breastfed (only formula)')),
+         bfq_duration_contrast = factor(case_when(bfq_duration == 0 ~ 'Not breastfed (only formula)',
+                                                  bfq_duration == 1 ~ 'Breastfed <6 months',
+                                                  bfq_duration >= 2 ~ 'Breastfed >6 months'), levels = c('Not breastfed (only formula)', 'Breastfed <6 months', 'Breastfed >6 months')),
+                 max_education_category = factor(max_education_category, levels = c('<HS', 'HS/GED', 'Some college', 'Bachelor', 'Postgrad'))) %>% 
+  select(src_subject_id, eventname, site, family_id, 
+         # mode_of_delivery, pregnancy_complications, preterm_yes_no, birth_complications,
+         bmi, bmi_group, age_mos, child_sex, max_education_category, birthweight_gr, pds, bf_yes_no, bfq_duration, bfq_duration_contrast) %>% 
+  drop_na() %>% 
+  droplevels()
+
+table(df.analysis$eventname)    # MAKE SURE THESE ARE THE SAME NUMBERS AS IN TABLE 1
+
+# Effects-code categorical variables
+
+contrasts(df.analysis$max_education_category) <- cbind('<HS' = c(-1, 0.25, 0.25, 0.25, 0.25),          
+                                                       'HS/GED' = c(0.25, -1, 0.25, 0.25, 0.25),          
+                                                       'Some college' = c(0.25, 0.25, -1, 0.25, 0.25),            
+                                                       'Bachelor degree' = c(0.25, 0.25, 0.25, -1, 0.25),
+                                                       'Postgrad degree' = c(0.25, 0.25, 0.25, 0.25, -1))
+
+contrasts(df.analysis$max_education_category)
+
+contrasts(df.analysis$child_sex) <- contr.sum(levels(as.factor(df.analysis$child_sex)))
+
+contrasts(df.analysis$child_sex)
+
+# contrasts(df.analysis$preterm_yes_no) <- contr.sum(levels(as.factor(df.analysis$preterm_yes_no)))
+# 
+# contrasts(df.analysis$preterm_yes_no)
+# 
+# contrasts(df.analysis$mode_of_delivery) <- contr.sum(levels(as.factor(df.analysis$mode_of_delivery)))
+# 
+# contrasts(df.analysis$mode_of_delivery)
+# 
+# contrasts(df.analysis$pregnancy_complications) <- contr.sum(levels(as.factor(df.analysis$pregnancy_complications)))
+# 
+# contrasts(df.analysis$pregnancy_complications)
+# 
+# contrasts(df.analysis$birth_complications) <- contr.sum(levels(as.factor(df.analysis$birth_complications)))
+# 
+# contrasts(df.analysis$birth_complications)
+
+contrasts(df.analysis$bf_yes_no) <- contr.sum(levels(as.factor(df.analysis$bf_yes_no)))
+
+contrasts(df.analysis$bf_yes_no)
+
+contrasts(df.analysis$bfq_duration_contrast) <- cbind('no vs <6' = c(-1, 1, 0),          
+                                                       '>6 months' = c(-.5, -.5, 1))
+
+contrasts(df.analysis$bfq_duration_contrast)
+
+# Scale continuous variables across sexes, for boys, and girls separately and store in separate dataframes
+
+(to.center <- c('age_mos', 'birthweight_gr', 'pds', 'bfq_duration')) 
+
+df.analysis_g <- df.analysis %>%
+  mutate_at(vars(all_of(to.center)), ~as.numeric(scale(., center = T, scale = F)))
+
+df.analysis_m <- df.analysis %>%
+  filter(child_sex == 'Male') %>% 
+  mutate_at(vars(all_of(to.center)), ~as.numeric(scale(., center = T, scale = F))) 
+  
+df.analysis_f <- df.analysis %>%
+  filter(child_sex == 'Female') %>% 
+  mutate_at(vars(all_of(to.center)), ~as.numeric(scale(., center = T, scale = F)))
+
+# Check skewness (if absolute skewness < 2 it is ok)
+
+lapply(df.analysis_g %>% select(bmi, all_of(to.center)), function(x)
+  abs(e1071::skewness(x)))
+
+lapply(df.analysis_m %>% select(bmi, all_of(to.center)), function(x)
+  abs(e1071::skewness(x)))
+
+lapply(df.analysis_f %>% select(bmi, all_of(to.center)), function(x)
+  abs(e1071::skewness(x)))
+
+# Check correlations among predictors
+
+df.analysis_g %>% 
+  select(age_mos, child_sex, bf_yes_no, bfq_duration, pds, max_education_category, birthweight_gr) %>% 
+  mutate(across(everything(), as.numeric)) %>% 
+  as.matrix() %>% 
+  cor(use = 'pairwise.complete.obs')
+
+df.analysis_m %>% 
+  select(age_mos, bf_yes_no, bfq_duration, pds, max_education_category, birthweight_gr) %>% 
+  mutate(across(everything(), as.numeric)) %>% 
+  as.matrix() %>% 
+  cor(use = 'pairwise.complete.obs')
+
+df.analysis_f %>% 
+  select(age_mos, bf_yes_no, bfq_duration, pds, max_education_category, birthweight_gr) %>% 
+  mutate(across(everything(), as.numeric)) %>% 
+  as.matrix() %>% 
+  cor(use = 'pairwise.complete.obs')
+
+```
+
+#4. ANALYSIS: EVER BREASTFED
+
+```{R}
+
+# Across sexes
+
+summary(model.bf.all <- lmer(bmi ~ age_mos * bf_yes_no + child_sex + max_education_category + birthweight_gr + pds + 
+                               # birth_complications +
+                               # pregnancy_complications +
+                               # mode_of_delivery +
+                               # preterm_yes_no +
+                               (1 | src_subject_id) + (1 | site), data = df.analysis_g))
+
+confint(model.bf.all, parm = 'age_mos:bf_yes_no1', level = 0.95)
+
+car::vif(model.bf.all)  # check VIF
+
+e1071::kurtosis(resid(model.bf.all))
+
+e1071::skewness(resid(model.bf.all))
+
+# Boys only
+
+summary(model.bf.m <- lmer(bmi ~ age_mos * bf_yes_no + max_education_category + birthweight_gr + pds +
+                              # birth_complications +
+                              # pregnancy_complications +
+                              # mode_of_delivery +
+                              # preterm_yes_no +
+                             (1 | src_subject_id) + (1 | site), data = df.analysis_m))
+
+confint(model.bf.m, parm = 'age_mos:bf_yes_no1', level = 0.95)
+
+car::vif(model.bf.m)
+
+e1071::kurtosis(resid(model.bf.m))
+
+e1071::skewness(resid(model.bf.m))
+
+# Girls only
+
+summary(model.bf.f <- lmer(bmi ~ age_mos * bf_yes_no + max_education_category + birthweight_gr + pds + 
+                              # birth_complications +
+                              # pregnancy_complications +
+                              # mode_of_delivery +
+                              # preterm_yes_no +
+                             (1 | src_subject_id) + + (1 | site), data = df.analysis_f))
+
+confint(model.bf.f, parm = 'age_mos:bf_yes_no1', level = 0.95)
+
+car::vif(model.bf.f)
+
+e1071::kurtosis(resid(model.bf.f))
+
+e1071::skewness(resid(model.bf.f))
+
+```
+
+## Plot ever-breastfed
+
+```{R}
+
+xp <- -29
+yp <- 21.5
+yp2 <- 21.1
+
+(beta_value.all <- as.character(round(summary(model.bf.all)[[10]][11,1], 3)))
+(p_value.all <- ifelse(summary(model.bf.all)[[10]][11,5] < 0.001, ' < 0.001', paste0(' = ', as.character(round(summary(model.bf.all)[[10]][11,5], 3)))))
+
+preds.all <- ggpredict(model.bf.all, terms = c('age_mos', 'bf_yes_no'))
+
+(a <- ggplot() +
+  geom_ribbon(data = preds.all,
+              aes(x = x, ymin = conf.low, ymax = conf.high, fill = group),
+              show.legend = F,
+              alpha = 0.1) +  # Confidence interval
+  geom_line(data = preds.all,
+            aes(x = x, y = predicted, colour = group),
+            linewidth = .5) +  # Prediction line
+  labs(title = 'Across sexes') +
+  theme_minimal() +
+    theme(axis.title = element_blank(),
+          axis.text.x = element_blank(),
+          plot.title = element_text(hjust = .5, size = 15, face = 'bold')) +
+  scale_colour_manual(values = c('steelblue', 'firebrick')) +
+  scale_fill_manual(values = c('steelblue', 'firebrick')) +
+  scale_y_continuous(breaks = c(16, 17, 18, 19, 20, 21),
+                     limits = c(15, 22)) +
+  scale_x_continuous(breaks = c(-15, 5, 25),
+                     labels = c('baseline', 'year1', 'year2')) +
+   guides(colour = guide_legend(title = ""),
+          fill = guide_legend(title = "Confidence Interval")) +
+  annotate("text", x = xp, y = yp, label = paste0("β = ", beta_value.all, ", p", p_value.all), size = 2.5, hjust = 0))
+
+(beta_value.m <- as.character(round(summary(model.bf.m)[[10]][10,1], 3)))
+(p_value.m <- ifelse(summary(model.bf.m)[[10]][10,5] < 0.001, ' < 0.001', paste0(' = ', as.character(round(summary(model.bf.m)[[10]][10,5], 3)))))
+
+preds.boys <- ggpredict(model.bf.m, terms = c('age_mos', 'bf_yes_no'))
+
+(b <- ggplot() +
+  geom_ribbon(data = preds.boys,
+              aes(x = x, ymin = conf.low, ymax = conf.high, fill = group),
+              show.legend = F,
+              alpha = 0.1) +  # Confidence interval
+  geom_line(data = preds.boys,
+            aes(x = x, y = predicted, colour = group),
+            show.legend = F,
+            linewidth = .5) +  # Prediction line
+  labs(title = 'Boys only') +
+  theme_minimal() +
+     theme(plot.title = element_text(size = 15, face = 'bold', hjust = 0.5),
+           axis.title = element_blank(),
+           axis.text = element_blank(),
+           axis.line.y = element_blank()) +
+  scale_colour_manual(values = c('steelblue', 'firebrick')) +
+  scale_fill_manual(values = c('steelblue', 'firebrick')) +
+  scale_y_continuous(breaks = c(16, 17, 18, 19, 20, 21),
+                      limits = c(15, 22)) +
+  scale_x_continuous(breaks = c(-15, 5, 25),
+                     labels = c('baseline', 'year1', 'year2')) +
+  annotate("text", x = xp, y = yp, label = paste0("β = ", beta_value.m, ", p", p_value.m), size = 2.5, hjust = 0))
+
+(beta_value.f <- as.character(round(summary(model.bf.f)[[10]][10,1], 3)))
+(p_value.f <- ifelse(summary(model.bf.f)[[10]][10,5] < 0.001, ' < 0.001', paste0(' = ', as.character(round(summary(model.bf.f)[[10]][10,5], 3)))))
+
+preds.girls <- ggpredict(model.bf.f, terms = c('age_mos', 'bf_yes_no'))
+
+(c <- ggplot() +
+  geom_ribbon(data = preds.girls,
+              aes(x = x, ymin = conf.low, ymax = conf.high, fill = group),
+              show.legend = F,
+              alpha = 0.1) +  # Confidence interval
+  geom_line(data = preds.girls,
+            aes(x = x, y = predicted, colour = group),
+            show.legend = F,
+            linewidth = .5) +  # Prediction line
+  labs(title = 'Girls only') +
+  theme_minimal() +
+     theme(plot.title = element_text(size = 15, face = 'bold', hjust = 0.5),
+           axis.title = element_blank(),
+           axis.text = element_blank(),
+           axis.line.y = element_blank()) +
+  scale_colour_manual(values = c('steelblue', 'firebrick')) +
+  scale_fill_manual(values = c('steelblue', 'firebrick')) +
+  scale_y_continuous(breaks = c(16, 17, 18, 19, 20, 21),
+                     limits = c(15, 22)) +
+  scale_x_continuous(breaks = c(-15, 5, 25),
+                     labels = c('baseline', 'year1', 'year2')) +
+  annotate("text", x = xp, y = yp, label = paste0("β = ", beta_value.f, ', p', p_value.f), size = 2.5, hjust = 0))
+
+(p1 <- ggarrange(a, b, c, align = "v", ncol = 3, common.legend = T, legend = 'right'))
+
+```
+
+#5. ANALYSIS: BREASTFEEDING DURATION
+
+```{R}
+
+# Across sexes
+
+summary(model.bfd.all <- lmer(bmi ~ age_mos * bfq_duration_contrast + child_sex + max_education_category + birthweight_gr + pds + 
+                               # birth_complications +
+                               # pregnancy_complications +
+                               # mode_of_delivery +
+                               # preterm_yes_no + 
+                                (1 | src_subject_id) + (1 | site), data = df.analysis_g))
+
+confint(model.bfd.all, parm = 'age_mos:bfq_duration_contrast>6 months', level = 0.95)
+
+car::vif(model.bfd.all)
+
+# Boys only
+
+summary(model.bfd.m <- lmer(bmi ~ age_mos * bfq_duration_contrast + max_education_category + birthweight_gr + pds + 
+                               # birth_complications +
+                               # pregnancy_complications +
+                               # mode_of_delivery +
+                               # preterm_yes_no +
+                              (1 | src_subject_id) + (1 | site), data = df.analysis_m))
+
+confint(model.bfd.m, parm = 'age_mos:bfq_duration_contrast>6 months', level = 0.95)
+
+car::vif(model.bfd.m)
+
+# Girls only
+
+summary(model.bfd.f <- lmer(bmi ~ age_mos * bfq_duration_contrast + max_education_category + birthweight_gr + pds + 
+                               # birth_complications +
+                               # pregnancy_complications +
+                               # mode_of_delivery +
+                               # preterm_yes_no +
+                              (1 | src_subject_id) + (1 | site), data = df.analysis_f))
+
+car::vif(model.bfd.f)
+
+confint(model.bfd.f, parm = 'age_mos:bfq_duration_contrast>6 months', level = 0.95)
+
+```
+
+## Plot breastfeeding duration
+
+```{R}
+
+(beta_value.all1 <- as.character(round(summary(model.bfd.all)[[10]][12,1], 3)))
+(p_value.all1 <- ifelse(summary(model.bfd.all)[[10]][12,5] < 0.001, ' < 0.001', paste0(' = ', as.character(round(summary(model.bfd.all)[[10]][12,5], 3)))))
+
+(beta_value.all2 <- as.character(round(summary(model.bfd.all)[[10]][13,1], 3)))
+(p_value.all2 <- ifelse(summary(model.bfd.all)[[10]][13,5] < 0.001, ' < 0.001', paste0(' = ', as.character(round(summary(model.bfd.all)[[10]][13,5], 3)))))
+
+preds.all <- ggpredict(model.bfd.all, terms = c('age_mos', 'bfq_duration_contrast'))
+
+(d <- ggplot() +
+  geom_ribbon(data = preds.all,
+              aes(x = x, ymin = conf.low, ymax = conf.high, fill = group),
+              show.legend = F,
+              alpha = 0.1) +  # Confidence interval
+  geom_line(data = preds.all,
+            aes(x = x, y = predicted, colour = group),
+            linewidth = .5) +  # Prediction line
+  theme_minimal() +
+    theme(axis.title = element_blank(),
+          plot.title = element_text(hjust = .5, size = 15, face = 'bold')) +
+  scale_colour_manual(values = c('steelblue', 'orchid', 'darkgreen')) +
+  scale_fill_manual(values = c('steelblue', 'orchid', 'darkgreen')) +
+  scale_y_continuous(breaks = c(16, 17, 18, 19, 20, 21),
+                     limits = c(15, 22)) +
+  scale_x_continuous(breaks = c(-15, 5, 25),  # Midpoints
+                     labels = c('baseline', 'year1', 'year2')) +
+  guides(colour = guide_legend(title = ""),
+         fill = guide_legend(title = "Confidence Interval")) +
+  annotate("text", x = xp, y = yp,  label = paste0("Contrast 1: β = ", beta_value.all1, ', p', p_value.all1), size = 2.5, hjust = 0) +
+  annotate("text", x = xp, y = yp2, , label = paste0("Contrast 2: β = ", beta_value.all2, ', p ', p_value.all2), size = 2.5, hjust = 0))
+
+(beta_value.m1 <- as.character(round(summary(model.bfd.m)[[10]][11,1], 3)))
+(p_value.m1 <- ifelse(summary(model.bfd.m)[[10]][11,5] < 0.001, ' < 0.001', paste0(' = ', as.character(round(summary(model.bfd.m)[[10]][11,5], 3)))))
+
+(beta_value.m2 <- as.character(round(summary(model.bfd.m)[[10]][12,1], 3)))
+(p_value.m2 <- ifelse(summary(model.bfd.m)[[10]][12,5] < 0.001, ' < 0.001', paste0(' = ', as.character(round(summary(model.bfd.m)[[10]][12,5], 3)))))
+
+preds.boys <- ggeffects::ggpredict(model.bfd.m, terms = c('age_mos', 'bfq_duration_contrast'))
+
+(e <- ggplot() +
+  geom_ribbon(data = preds.boys,
+              aes(x = x, ymin = conf.low, ymax = conf.high, fill = group),
+              show.legend = F,
+              alpha = 0.1) +  # Confidence interval
+  geom_line(data = preds.boys,
+            aes(x = x, y = predicted, colour = group),
+            linewidth = .5) +  # Prediction line
+  theme_minimal() +
+    theme(axis.title = element_blank(),
+          axis.text.y = element_blank(),
+          plot.title = element_text(hjust = .5, size = 15, face = 'bold')) +
+  scale_colour_manual(values = c('steelblue', 'orchid', 'darkgreen')) +
+  scale_fill_manual(values = c('steelblue', 'orchid', 'darkgreen')) +
+  scale_y_continuous(breaks = c(16, 17, 18, 19, 20, 21),
+                     limits = c(15, 22)) +
+  scale_x_continuous(breaks = c(-15, 5, 25),  # Midpoints
+                     labels = c('baseline', 'year1', 'year2')) +
+  guides(colour = guide_legend(title = ""),
+         fill = guide_legend(title = "Confidence Interval")) +
+  annotate("text", x = xp, y = yp, label = paste0("Contrast 1: β = ", beta_value.m1, ', p', p_value.m1), size = 2.5, hjust = 0) +
+  annotate("text", x = xp, y = yp2, label = paste0("Contrast 2: β = ", beta_value.m2, ', p', p_value.m2), size = 2.5, hjust = 0))
+
+(beta_value.f1 <- as.character(round(summary(model.bfd.f)[[10]][11,1], 3)))
+(p_value.f1 <- ifelse(summary(model.bfd.f)[[10]][11,5] < 0.001, ' < 0.001', paste0(' = ', as.character(round(summary(model.bfd.f)[[10]][11,5], 3)))))
+
+(beta_value.f2 <- as.character(round(summary(model.bfd.f)[[10]][12,1], 3)))
+(p_value.f2 <- ifelse(summary(model.bfd.f)[[10]][12,5] < 0.001, ' < 0.001', paste0(' = ', as.character(round(summary(model.bfd.f)[[10]][12,5], 3)))))
+
+pred.girls <- ggeffects::ggpredict(model.bfd.f, terms = c('age_mos', 'bfq_duration_contrast'))
+
+(f <- ggplot() +
+  geom_ribbon(data = pred.girls,
+              aes(x = x, ymin = conf.low, ymax = conf.high, fill = group),
+              show.legend = F,
+              alpha = 0.1) +  # Confidence interval
+  geom_line(data = pred.girls,
+            aes(x = x, y = predicted, colour = group),
+            linewidth = .5) +  # Prediction line
+  theme_minimal() +
+    theme(axis.title = element_blank(),
+          axis.text.y = element_blank(),
+          plot.title = element_text(hjust = .5, size = 15, face = 'bold')) +
+  scale_colour_manual(values = c('steelblue', 'orchid', 'darkgreen')) +
+  scale_fill_manual(values = c('steelblue', 'orchid', 'darkgreen')) +
+  scale_y_continuous(breaks = c(16, 17, 18, 19, 20, 21),
+                     limits = c(15, 22)) +
+  scale_x_continuous(breaks = c(-15, 5, 25),  # Midpoints
+                     labels = c('baseline', 'year1', 'year2')) +
+  guides(colour = guide_legend(title = ""),
+         fill = guide_legend(title = "Confidence Interval")) +
+  annotate("text", x = xp, y = yp, label = paste0("Contrast 1: β = ", beta_value.f1, ', p', p_value.f1), size = 2.5, hjust = 0) +
+  annotate("text", x = xp, y = yp2, label = paste0("Contrast 2: β = ", beta_value.f2, ', p', p_value.f2), size = 2.5, hjust = 0))
+
+(p2 <- ggarrange(d, e, f, align = "v", ncol = 3, common.legend = T, legend = 'right'))
+
+(fig1 <- ggarrange(p1, p2, nrow = 2))
+
+(p3 <- annotate_figure(fig1, left = text_grob(expression("Body Mass Index (BMI, kg/m"^2*")"), vjust = 0.5, rot = 90)) + theme(plot.background = element_rect(fill = 'white')))
+
+ggsave(filename = 'fig1.png', plot = p3, width = 3.5, height = 2, scale = 3, dpi = 300)
+
+```
+
+#6. SUPPLEMENTARY ANALYSIS: PDS AND EVER BREASTFED
+
+```{R}
+ 
+summary(model.pds.all <- lmer(bmi ~ pds * bf_yes_no + child_sex + max_education_category + birthweight_gr + age_mos +
+                               #   birth_complications +
+                               # pregnancy_complications +
+                               # mode_of_delivery +
+                               # preterm_yes_no +
+                                (1 | src_subject_id) + (1 | site), data = df.analysis_g))
+
+car::vif(model.pds.all)
+
+confint(model.pds.all, parm = 'pds:bf_yes_no1', level = 0.95)
+
+summary(model.pds.m <- lmer(bmi ~ pds * bf_yes_no + max_education_category + birthweight_gr + age_mos + 
+                               # birth_complications +
+                               # pregnancy_complications +
+                               # mode_of_delivery +
+                               # preterm_yes_no +
+                              (1 | src_subject_id) + (1 | site), data = df.analysis_m))
+
+car::vif(model.pds.m)
+
+confint(model.pds.m, parm = 'pds:bf_yes_no1', level = 0.95)
+
+summary(model.pds.f <- lmer(bmi ~ pds * bf_yes_no + max_education_category + birthweight_gr + age_mos + 
+                               # birth_complications +
+                               # pregnancy_complications +
+                               # mode_of_delivery +
+                               # preterm_yes_no +
+                              (1 | src_subject_id) + (1 | site), data = df.analysis_f))
+
+car::vif(model.pds.f)
+
+confint(model.pds.f, parm = 'pds:bf_yes_no1', level = 0.95)
+
+```
+
+## Plot the results
+
+```{R}
+
+xp <- -1.25
+yp <- 19.75
+yp2 <- 19.55
+
+pred.all <- ggeffects::ggpredict(model.pds.all, terms = c('pds', 'bf_yes_no'))
+
+(beta_value.all <- as.character(round(summary(model.pds.all)[[10]][11,1], 3)))
+(p_value.all <- ifelse(summary(model.pds.all)[[10]][11,5] < 0.001, ' < 0.001', paste0(' = ', as.character(round(summary(model.pds.all)[[10]][11,5], 3)))))
+
+(a2 <- ggplot() +
+  geom_ribbon(data = pred.all,
+              aes(x = x, ymin = conf.low, ymax = conf.high, fill = group),
+              show.legend = F,
+              alpha = 0.1) +  # Confidence interval
+  geom_line(data = pred.all,
+            aes(x = x, y = predicted, colour = group),
+            linewidth = .5) +  # Prediction line
+  labs(title = 'Across sexes') +
+  theme_minimal() +
+    theme(axis.title = element_blank(),
+          axis.text.x = element_blank(),
+          plot.title = element_text(hjust = .5, size = 15, face = 'bold')) +
+  scale_colour_manual(values = c('steelblue', 'indianred2')) +
+  scale_fill_manual(values = c('steelblue', 'indianred2')) +
+  scale_y_continuous(breaks = c(17, 17.5, 18, 18.5, 19, 19.5),
+                     limits = c(16.5, 20)) +
+  scale_x_continuous(breaks = c(-1, 0, 1, 2),
+                     labels = c(1, 2, 3, 4)) +
+  guides(colour = guide_legend(title = ""),
+         fill = guide_legend(title = "Confidence Interval")) +
+  annotate("text", x = xp, y = yp, label = paste0("β = ", beta_value.all, ", p", p_value.all), size = 2.5, hjust = 0))
+
+pred.boys <- ggeffects::ggpredict(model.pds.m, terms = c('pds', 'bf_yes_no'))
+
+(beta_value.m <- as.character(round(summary(model.pds.m)[[10]][10,1], 3)))
+(p_value.m <- ifelse(summary(model.pds.m)[[10]][10,5] < 0.001, ' < 0.001', paste0(' = ', as.character(round(summary(model.pds.m)[[10]][10,5], 3)))))
+
+(b2 <- ggplot() +
+  geom_ribbon(data = pred.boys,
+              aes(x = x, ymin = conf.low, ymax = conf.high, fill = group),
+              show.legend = F,
+              alpha = 0.1) +  # Confidence interval
+  geom_line(data = pred.boys,
+            aes(x = x, y = predicted, colour = group),
+            linewidth = .5) +  # Prediction line
+  labs(title = 'Boys only') +
+  theme_minimal() +
+    theme(axis.title = element_blank(),
+          axis.text = element_blank(),
+          plot.title = element_text(hjust = .5, size = 15, face = 'bold')) +
+  scale_colour_manual(values = c('steelblue', 'indianred2')) +
+  scale_fill_manual(values = c('steelblue', 'indianred2')) +
+  scale_y_continuous(breaks = c(17, 17.5, 18, 18.5, 19, 19.5),
+                     limits = c(16.5, 20)) +
+  scale_x_continuous(breaks = c(-1, 0, 1, 2),
+                     labels = c(1, 2, 3, 4)) +
+  guides(colour = guide_legend(title = ""),
+        fill = guide_legend(title = "Confidence Interval")) +
+    annotate("text", x = xp, y = yp, label = paste0("β = ", beta_value.m, ", p", p_value.m), size = 2.5, hjust = 0))
+
+pred.girls <- ggeffects::ggpredict(model.pds.f, terms = c('pds', 'bf_yes_no'))
+
+(beta_value.f <- as.character(round(summary(model.pds.f)[[10]][10,1], 3)))
+(p_value.f <- ifelse(summary(model.pds.f)[[10]][10,5] < 0.001, ' < 0.001', paste0(' = ', as.character(round(summary(model.pds.f)[[10]][10,5], 3)))))
+
+(c2 <- ggplot() +
+  geom_ribbon(data = pred.girls,
+              aes(x = x, ymin = conf.low, ymax = conf.high, fill = group),
+              show.legend = F,
+              alpha = 0.1) +  # Confidence interval
+  geom_line(data = pred.girls,
+            aes(x = x, y = predicted, colour = group),
+            linewidth = .5) +  # Prediction line
+  labs(title = 'Girls only') +
+  theme_minimal() +
+    theme(axis.title = element_blank(),
+          axis.text = element_blank(),
+          plot.title = element_text(hjust = .5, size = 15, face = 'bold')) +
+  scale_colour_manual(values = c('steelblue', 'indianred2')) +
+  scale_fill_manual(values = c('steelblue', 'indianred2')) +
+  scale_y_continuous(breaks = c(17, 17.5, 18, 18.5, 19, 19.5),
+                     limits = c(16.5, 20)) +
+  scale_x_continuous(breaks = c(-1, 0, 1, 2),
+                     labels = c(1, 2, 3, 4)) +
+  guides(colour = guide_legend(title = ""),
+         fill = guide_legend(title = "Confidence Interval")) +
+  annotate("text", x = xp, y = yp, label = paste0("β = ", beta_value.f, ", p", p_value.f), size = 2.5, hjust = 0))
+
+(p4 <- ggpubr::ggarrange(a2, b2, c2, align = "v", ncol = 3, common.legend = T, legend = 'right'))
+
+```
+
+#7 SUPPLEMENTARY ANALYSIS: PDS AND BF DURATION
+
+```{R}
+
+summary(model.pds.bfd.all <- lmer(bmi ~ pds * bfq_duration_contrast + child_sex + max_education_category + birthweight_gr + age_mos +
+                               #       birth_complications +
+                               # pregnancy_complications +
+                               # mode_of_delivery +
+                               # preterm_yes_no +
+                                    (1 | src_subject_id) + (1 | site), data = df.analysis_g))
+
+car::vif(model.pds.bfd.all)
+
+confint(model.pds.bfd.all, parm = 'pds:bfq_duration_contrast>6 months', level = 0.95)
+
+summary(model.pds.bfd.m <- lmer(bmi ~ pds * bfq_duration_contrast + max_education_category + birthweight_gr + age_mos + 
+                               #     birth_complications +
+                               # pregnancy_complications +
+                               # mode_of_delivery +
+                               # preterm_yes_no +
+                                  (1 | src_subject_id) + (1 | site), data = df.analysis_m))
+
+car::vif(model.pds.bfd.m)
+
+confint(model.pds.bfd.m, parm = 'pds:bfq_duration_contrast>6 months', level = 0.95)
+
+summary(model.pds.bfd.f <- lmer(bmi ~ pds * bfq_duration_contrast + max_education_category + birthweight_gr + age_mos + 
+                               #     birth_complications +
+                               # pregnancy_complications +
+                               # mode_of_delivery +
+                               # preterm_yes_no +
+                                 (1 | src_subject_id) + (1 | site), data = df.analysis_f))
+
+car::vif(model.pds.bfd.f)
+
+confint(model.pds.bfd.f, parm = 'pds:bfq_duration_contrast>6 months', level = 0.95)
+
+
+```
+
+## Plot results
+
+```{R}
+
+(beta_value.all1 <- as.character(round(summary(model.pds.bfd.all)[[10]][12,1], 3)))
+(p_value.all1 <- ifelse(summary(model.pds.bfd.all)[[10]][12,5] < 0.001, ' < 0.001', paste0(' = ', as.character(round(summary(model.pds.bfd.all)[[10]][12,5], 3)))))
+
+(beta_value.all2 <- as.character(round(summary(model.pds.bfd.all)[[10]][13,1], 3)))
+(p_value.all2 <- ifelse(summary(model.pds.bfd.all)[[10]][13,5] < 0.001, ' < 0.001', paste0(' = ', as.character(round(summary(model.pds.bfd.all)[[10]][13,5], 3)))))
+
+preds.all <- ggpredict(model.pds.bfd.all, terms = c('pds', 'bfq_duration_contrast'))
+
+(d2 <- ggplot() +
+  geom_ribbon(data = preds.all,
+              aes(x = x, ymin = conf.low, ymax = conf.high, fill = group),
+              show.legend = F,
+              alpha = 0.1) +  # Confidence interval
+  geom_line(data = preds.all,
+            aes(x = x, y = predicted, colour = group),
+            linewidth = .5) +  # Prediction line
+  theme_minimal() +
+    theme(axis.title = element_blank(),
+          plot.title = element_text(hjust = .5, size = 15, face = 'bold')) +
+  scale_colour_manual(values = c('steelblue', 'orchid', 'darkgreen')) +
+  scale_fill_manual(values = c('steelblue', 'orchid', 'darkgreen')) +
+  scale_y_continuous(breaks = c(17, 17.5, 18, 18.5, 19, 19.5),
+                     limits = c(16.5, 20)) +
+  scale_x_continuous(breaks = c(-1, 0, 1, 2),
+                     labels = c(1, 2, 3, 4)) +
+  guides(colour = guide_legend(title = ""),
+         fill = guide_legend(title = "Confidence Interval")) +
+  annotate("text", x = xp, y = yp,  label = paste0("Contrast 1: β = ", beta_value.all1, ', p', p_value.all1), size = 2.5, hjust = 0) +
+  annotate("text", x = xp, y = yp2, , label = paste0("Contrast 2: β = ", beta_value.all2, ', p', p_value.all2), size = 2.5, hjust = 0))
+
+pred.boys <- ggpredict(model.pds.bfd.m, terms = c('pds', 'bfq_duration_contrast'))
+
+(beta_value.m1 <- as.character(round(summary(model.pds.bfd.m)[[10]][11,1], 3)))
+(p_value.m1 <- ifelse(summary(model.pds.bfd.m)[[10]][11,5] < 0.001, ' < 0.001', paste0(' = ', as.character(round(summary(model.pds.bfd.m)[[10]][11,5], 3)))))
+
+(beta_value.m2 <- as.character(round(summary(model.pds.bfd.m)[[10]][12,1], 3)))
+(p_value.m2 <- ifelse(summary(model.pds.bfd.m)[[10]][12,5] < 0.001, ' < 0.001', paste0(' = ', as.character(round(summary(model.pds.bfd.m)[[10]][12,5], 3)))))
+
+(e2 <- ggplot() +
+  geom_ribbon(data = pred.boys,
+              aes(x = x, ymin = conf.low, ymax = conf.high, fill = group),
+              show.legend = F,
+              alpha = 0.1) +  # Confidence interval
+  geom_line(data = pred.boys,
+            aes(x = x, y = predicted, colour = group),
+            linewidth = .5) +  # Prediction line
+  theme_minimal() +
+  theme(axis.text.y = element_blank(),
+        axis.title = element_blank(),
+        plot.title = element_text(hjust = .5, size = 15, face = 'bold')) +
+  scale_colour_manual(values = c('steelblue', 'orchid', 'darkgreen')) +
+  scale_fill_manual(values = c('steelblue', 'orchid', 'darkgreen')) +
+  scale_y_continuous(breaks = c(17, 17.5, 18, 18.5, 19, 19.5),
+                     limits = c(16.5, 20)) +
+  scale_x_continuous(breaks = c(-1, 0, 1, 2),
+                     labels = c(1, 2, 3, 4)) +
+  guides(colour = guide_legend(title = ""),
+         fill = guide_legend(title = "Confidence Interval")) +
+  annotate("text", x = xp, y = yp,  label = paste0("Contrast 1: β = ", beta_value.m1, ', p', p_value.m1), size = 2.5, hjust = 0) +
+  annotate("text", x = xp, y = yp2, , label = paste0("Contrast 2: β = ", beta_value.m2, ', p', p_value.m2), size = 2.5, hjust = 0))
+
+pred.girls <- ggpredict(model.pds.bfd.f, terms = c('pds', 'bfq_duration_contrast'))
+
+(beta_value.f1 <- as.character(round(summary(model.pds.bfd.f)[[10]][11,1], 3)))
+(p_value.f1 <- ifelse(summary(model.pds.bfd.f)[[10]][11,5] < 0.001, ' < 0.001', paste0(' = ', as.character(round(summary(model.pds.bfd.f)[[10]][11,5], 3)))))
+
+(beta_value.f2 <- as.character(round(summary(model.pds.bfd.f)[[10]][12,1], 3)))
+(p_value.f2 <- ifelse(summary(model.pds.bfd.f)[[10]][12,5] < 0.001, ' < 0.001', paste0(' = ', as.character(round(summary(model.pds.bfd.f)[[10]][12,5], 3)))))
+
+(f2 <- ggplot() +
+  geom_ribbon(data = pred.girls,
+              aes(x = x, ymin = conf.low, ymax = conf.high, fill = group),
+              show.legend = F,
+              alpha = 0.1) +  # Confidence interval
+  geom_line(data = pred.girls,
+            aes(x = x, y = predicted, colour = group),
+            linewidth = .5) +  # Prediction line
+  theme_minimal() +
+    theme(axis.text.y = element_blank(),
+          axis.title = element_blank(),
+          plot.title = element_text(hjust = .5, size = 15, face = 'bold')) +
+  scale_colour_manual(values = c('steelblue', 'orchid', 'darkgreen')) +
+  scale_fill_manual(values = c('steelblue', 'orchid', 'darkgreen')) +
+  scale_y_continuous(breaks = c(17, 17.5, 18, 18.5, 19, 19.5),
+                     limits = c(16.5, 20)) +
+  scale_x_continuous(breaks = c(-1, 0, 1, 2),
+                     labels = c(1, 2, 3, 4)) +
+  guides(colour = guide_legend(title = ""),
+         fill = guide_legend(title = "Confidence Interval")) +
+  annotate("text", x = xp, y = yp,  label = paste0("Contrast 1: β = ", beta_value.f1, ', p', p_value.f1), size = 2.5, hjust = 0) +
+  annotate("text", x = xp, y = yp2, , label = paste0("Contrast 2: β = ", beta_value.f2, ', p', p_value.f2), size = 2.5, hjust = 0))
+
+(p5 <- ggpubr::ggarrange(d2, e2, f2, align = "v", ncol = 3, common.legend = T, legend = 'right'))
+
+(fig2 <- ggarrange(p4, p5, nrow = 2, align = 'hv'))
+
+(p6 <-  ggpubr::annotate_figure(fig2, left = text_grob(expression("Body Mass Index (BMI, kg/m"^2*")"), vjust = 0.5, rot = 90), bottom =  ggpubr::text_grob("Puberty scores", vjust = 0)) + theme(plot.background = element_rect(fill = 'white')))
+
+ggsave(filename = 'fig2.png', plot = p6, width = 3.5, height = 2, scale = 3, dpi = 300)
+
+```
+
+#8 PRE-ANALYSIS: LOGISTIC WEIGHTED GLM
+
+```{R}
+
+df.analysis2 <- df6 %>%
+  filter(eventname == '2_year_follow_up_y_arm_1') %>%
+  droplevels() %>%
+  mutate(puberty_yes_no = as.factor(ifelse(pds < 2, 'no', 'yes')),
+         preterm_yes_no = as.factor(ifelse(is.na(devhx_12_p) | between(devhx_12_p, 0, 3), 'no', 'yes')),
+         mode_of_delivery = as.factor(ifelse(mode_of_delivery == 'Do not know', NA, mode_of_delivery)),
+         birth_complications = as.factor(ifelse(birth_complications == 999, NA, birth_complications)),
+         pregnancy_complications = as.factor(ifelse(pregnancy_complications == 999, NA, pregnancy_complications)),
+         bmi_group = relevel(as.factor(bmi_group), ref = 'healthy'),
+         bf_yes_no = as.factor(ifelse(bfq_duration > 0, 'yes', 'no')),
+         bfq_duration_contrast = factor(case_when(bfq_duration == 0 ~ 'no breastfed',
+                                                  bfq_duration == 1 ~ '1-6 month',
+                                                  bfq_duration >= 2 ~ '>7 months'),
+                                        levels = c('no breastfed', '1-6 month', '>7 months')),
+         child_sex = as.factor(child_sex),
+         max_education_category = factor(max_education_category,
+                                         levels = c('<HS', 'HS/GED', 'Some college', 'Bachelor', 'Postgrad'))) %>%
+  select(src_subject_id, eventname, site, family_id,
+         preterm_yes_no, mode_of_delivery, pregnancy_complications, birth_complications,
+         bmi_group, age_mos, child_sex, max_education_category, birthweight_gr, pds, bf_yes_no, bfq_duration_contrast) %>% 
+  drop_na() %>% 
+  droplevels()
+
+table(df.analysis2$bmi_group)
+
+contrasts(df.analysis2$max_education_category) <- cbind('<HS' = c(-1, 0.25, 0.25, 0.25, 0.25),          
+                                                        'HS/GED' = c(0.25, -1, 0.25, 0.25, 0.25),          
+                                                        'Some college' = c(0.25, 0.25, -1, 0.25, 0.25),            
+                                                        'Bachelor degree' = c(0.25, 0.25, 0.25, -1, 0.25),
+                                                        'Postgrad degree' = c(0.25, 0.25, 0.25, 0.25, -1))
+
+contrasts(df.analysis2$max_education_category)
+
+contrasts(df.analysis2$child_sex) <- contr.treatment(levels(as.factor(df.analysis2$child_sex)))
+
+contrasts(df.analysis2$child_sex)
+
+contrasts(df.analysis2$mode_of_delivery) <- contr.treatment(levels(as.factor(df.analysis2$mode_of_delivery)))
+
+contrasts(df.analysis2$mode_of_delivery)
+
+contrasts(df.analysis2$preterm_yes_no) <- contr.treatment(levels(as.factor(df.analysis2$preterm_yes_no)))
+
+contrasts(df.analysis2$preterm_yes_no)
+
+contrasts(df.analysis2$pregnancy_complications) <- contr.treatment(levels(as.factor(df.analysis2$pregnancy_complications)))
+
+contrasts(df.analysis2$pregnancy_complications)
+
+contrasts(df.analysis2$birth_complications) <- contr.treatment(levels(as.factor(df.analysis2$birth_complications)))
+
+contrasts(df.analysis2$birth_complications)
+
+contrasts(df.analysis2$bf_yes_no) <- contr.treatment(levels(as.factor(df.analysis2$bf_yes_no)))
+
+contrasts(df.analysis2$bf_yes_no)
+
+contrasts(df.analysis2$bfq_duration_contrast) <- cbind('no vs yes' = c(0, 1, 0),          
+                                                       '>7 months' = c(0, 0, 1))
+
+contrasts(df.analysis2$bfq_duration_contrast) 
+
+contrasts(df.analysis2$bmi_group) <- contr.treatment(levels(as.factor(df.analysis2$bmi_group)))
+
+contrasts(df.analysis2$bmi_group)
+
+(to.center <- c('age_mos', 'birthweight_gr', 'pds', 'bfq_duration')) 
+
+df.analysis2_g <- df.analysis2 %>%
+  mutate_at(vars(any_of(to.center)), ~as.numeric(scale(., center = T, scale = F)))
+
+df.analysis2_m <- df.analysis2 %>%
+  filter(child_sex == 'Male') %>% 
+  mutate_at(vars(any_of(to.center)), ~as.numeric(scale(., center = T, scale = F)))
+
+df.analysis2_f <- df.analysis2 %>%
+  filter(child_sex == 'Female') %>% 
+  mutate_at(vars(any_of(to.center)), ~as.numeric(scale(., center = T, scale = F)))
+
+```
+
+#9. SUPPLEMENTARY ANALYSIS: LOG-REG AND EVER BREASTFED
+
+```{R}
+
+# ~ # ~ # ~ # ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ # ~ # ~ #
+# ~ # ~ # ~ A • C • R • O • S • S ~ # ~ # ~ #
+# ~ # ~ # ~ # ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ # ~ # ~ #
+
+class_weights_g <- ifelse(df.analysis2_g$bmi_group == "unhealthy", 
+                          sum(df.analysis2_g$bmi_group == "healthy") / sum(df.analysis2_g$bmi_group == "unhealthy"), 1)
+
+summary(model4 <- glm(bmi_group ~ bf_yes_no + child_sex + pds + age_mos + max_education_category + birthweight_gr +
+                         birth_complications +
+                               pregnancy_complications +
+                               mode_of_delivery +
+                               preterm_yes_no,
+                      family = 'binomial',
+                      weights = round(class_weights_g),
+                      data = df.analysis2_g))   # across sexes
+
+car::vif(model4)
+
+or_table <- exp(cbind(OR = coef(model4), confint(model4)))   # compute odd ratio and confidence intervals
+
+print(or_table)
+
+p0 <- mean(df.analysis2_g$bmi_group == "unhealthy")  # define the probability of being unhealthy weight 
+
+rr_table <- as.data.frame(or_table)                           # Calculate the Relative Risk (RR)
+rr_table$RR <- rr_table$OR / (1 - p0 + (p0 * rr_table$OR))
+
+print(as.matrix(rr_table))
+
+(1 - rr_table$RR[2]) * 100   #  Display the Relative Risk (RR%)
+
+## Accuracy
+
+df.analysis2_g$pred_prob <- predict(model4, type = "response")
+
+# Convert probabilities to binary predictions (using 0.5 as a threshold)
+df.analysis2_g$pred_class <- ifelse(df.analysis2_g$pred_prob > 0.5, "unhealthy", "healthy")
+
+# Compute accuracy
+accuracy <- mean(df.analysis2_g$pred_class == df.analysis2_g$bmi_group)
+
+print(accuracy)
+
+# ~ # ~ # ~ # ~ ~ ~ ~ ~ ~ ~ # ~ # ~ #
+# ~ # ~ # ~ B • O • Y • S ~ # ~ # ~ #
+# ~ # ~ # ~ # ~ ~ ~ ~ ~ ~ ~ # ~ # ~ #
+
+class_weights_m <- ifelse(df.analysis2_m$bmi_group == "unhealthy", 
+                          sum(df.analysis2_m$bmi_group == "healthy") / sum(df.analysis2_m$bmi_group == "unhealthy"), 1)
+
+summary(model4m <- glm(bmi_group ~ bf_yes_no + age_mos + pds + max_education_category + 
+                          birth_complications +
+                               pregnancy_complications +
+                               mode_of_delivery +
+                               preterm_yes_no +
+                         birthweight_gr,
+                       weights = round(class_weights_m),
+                       family = 'binomial',
+                       data = df.analysis2_m))   # boys
+
+car::vif(model4m)
+
+or_table <- exp(cbind(OR = coef(model4m), confint(model4m)))   # compute odd ratio and confidence intervals
+
+print(or_table)
+
+p0 <- mean(df.analysis2_m$bmi_group == "unhealthy")
+
+rr_table <- as.data.frame(or_table)
+rr_table$RR <- rr_table$OR / (1 - p0 + (p0 * rr_table$OR))
+
+print(as.matrix(rr_table))
+
+(1 - rr_table$RR[2]) * 100
+
+## Accuracy
+
+df.analysis2_m$pred_prob <- predict(model4m, type = "response")
+
+df.analysis2_m$pred_class <- ifelse(df.analysis2_m$pred_prob > 0.5, "unhealthy", "healthy")
+
+accuracy <- mean(df.analysis2_m$pred_class == df.analysis2_m$bmi_group)
+
+print(accuracy)
+
+# ~ # ~ # ~ # ~ ~ ~ ~ ~ ~ ~ ~ ~ # ~ # ~ #
+# ~ # ~ # ~ G • I • R • L • S ~ # ~ # ~ #
+# ~ # ~ # ~ # ~ ~ ~ ~ ~ ~ ~ ~ ~ # ~ # ~ #
+
+class_weights_f <- ifelse(df.analysis2_f$bmi_group == "unhealthy", 
+                          sum(df.analysis2_f$bmi_group == "healthy") / sum(df.analysis2_f$bmi_group == "unhealthy"), 1)
+
+summary(model4f <- glm(bmi_group ~ bf_yes_no + age_mos + pds + max_education_category + 
+                          birth_complications +
+                               pregnancy_complications +
+                               mode_of_delivery +
+                               preterm_yes_no +
+                         birthweight_gr,
+                       weights = round(class_weights_f),
+                       family = 'binomial',
+                       data = df.analysis2_f))   # girls
+
+car::vif(model4f)
+
+or_table <- exp(cbind(OR = coef(model4f), confint(model4f)))   # compute odd ratio and confidence intervals
+
+print(or_table)
+
+p0 <- mean(df.analysis2_f$bmi_group == "unhealthy")
+
+rr_table <- as.data.frame(or_table)
+rr_table$RR <- rr_table$OR / (1 - p0 + (p0 * rr_table$OR))
+
+print(as.matrix(rr_table))
+
+(1 - rr_table$RR[2]) * 100
+
+df.analysis2_f$pred_prob <- predict(model4f, type = "response")
+
+df.analysis2_f$pred_class <- ifelse(df.analysis2_f$pred_prob > 0.5, "unhealthy", "healthy")
+
+accuracy <- mean(df.analysis2_f$pred_class == df.analysis2_f$bmi_group)
+
+print(accuracy)
+
+```
+
+### Plot results
+
+```{R}
+
+preds.all <- ggpredict(model4, 'bf_yes_no')
+
+preds.all$x <- factor(preds.all$x, labels = c('Not breastfed (only formula)', 'Breastfed'))
+
+(a3 <- ggplot(preds.all, aes(x = x, y = predicted, group = group, color = x)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(group = group, ymin = conf.low, ymax = conf.high),
+                width = 0.2,
+                show.legend = F) +
+  scale_color_manual(values = c("steelblue", "firebrick")) +
+  scale_fill_manual(values = c("steelblue", "firebrick")) +
+  scale_y_continuous(limits = c(.4, .85)) +
+  labs(title = 'Across sexes') +
+  theme_minimal() +
+  theme(legend.title = element_blank(),
+        legend.text = element_text(size = 11),
+        axis.text.x = element_blank(),
+        axis.title = element_blank(),
+        plot.title = element_text(size = 15, hjust = .5, face = 'bold')))
+
+preds.boys <- ggpredict(model4m, 'bf_yes_no')
+
+preds.boys$x <- factor(preds.boys$x, labels = c('Not breastfed (only formula)', 'Breastfed'))
+
+(b3 <- ggplot(preds.boys, aes(x = x, y = predicted, group = group, color = x)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(group = group, ymin = conf.low, ymax = conf.high),
+                width = 0.2,
+                show.legend = F) +
+  scale_color_manual(values = c("steelblue", "firebrick")) +
+  scale_fill_manual(values = c("steelblue", "firebrick")) +
+  scale_y_continuous(limits = c(.4, .85)) +
+  labs(title = 'Boys only') +
+  theme_minimal() +
+  theme(legend.title = element_blank(),
+        legend.text = element_text(size = 11),
+        axis.text = element_blank(),
+        axis.title = element_blank(),
+        plot.title = element_text(size = 15, hjust = .5, face = 'bold')))
+
+preds.girls <- ggpredict(model4f, 'bf_yes_no')
+
+preds.girls$x <- factor(preds.girls$x, labels = c('Not breastfed (only formula)', 'Breastfed'))
+
+(c3 <- ggplot(preds.girls, aes(x = x, y = predicted, group = group, color = x)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(group = group, ymin = conf.low, ymax = conf.high),
+                width = 0.2,
+                show.legend = F) +
+  scale_color_manual(values = c("steelblue", "firebrick")) +
+  scale_fill_manual(values = c("steelblue", "firebrick")) +
+  scale_y_continuous(limits = c(.4, .85)) +
+  labs(title = 'Girls only') +
+  theme_minimal() +
+  theme(legend.title = element_blank(),
+        legend.text = element_text(size = 11),
+        axis.text = element_blank(),
+        axis.title = element_blank(),
+        plot.title = element_text(size = 15, hjust = .5, face = 'bold')))
+
+(p7 <- ggarrange(a3, b3, c3, ncol = 3, common.legend = T, legend = 'right'))
+
+```
+
+#10 SUPPLEMENTARY ANALYSIS: LOG REG AND BF DURATION
+
+```{R}
+
+# ~ # ~ # ~ # ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ # ~ # ~ #
+# ~ # ~ # ~ A • C • R • O • S • S ~ # ~ # ~ #
+# ~ # ~ # ~ # ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ # ~ # ~ #
+
+summary(model5 <- glm(bmi_group ~ bfq_duration_contrast + child_sex + age_mos + pds + max_education_category + 
+                         birth_complications +
+                               pregnancy_complications +
+                               mode_of_delivery +
+                               preterm_yes_no +
+                        birthweight_gr,
+                      weights = round(class_weights_g),
+                      family = 'binomial',
+                      data = df.analysis2_g))   # across sexes
+
+car::vif(model5)
+
+or_table <- exp(cbind(OR = coef(model5), confint(model5)))
+
+print(or_table)
+
+p0 <- mean(df.analysis2_g$bmi_group == "unhealthy")
+
+# # Calculate the Relative Risk (RR)
+rr_table <- as.data.frame(or_table)
+rr_table$RR <- rr_table$OR / (1 - p0 + (p0 * rr_table$OR))
+
+print(as.matrix(rr_table))
+
+# # Display the Relative Risk (RR%)
+(1 - rr_table$RR[2]) * 100
+(1 - rr_table$RR[3]) * 100
+
+## Accuracy
+
+df.analysis2_g$pred_prob <- predict(model5, type = "response")
+
+df.analysis2_g$pred_class <- ifelse(df.analysis2_g$pred_prob > 0.5, "unhealthy", "healthy")
+
+accuracy <- mean(df.analysis2_g$pred_class == df.analysis2_g$bmi_group)
+
+print(accuracy)
+
+# ~ # ~ # ~ # ~ ~ ~ ~ ~ ~ ~ # ~ # ~ #
+# ~ # ~ # ~ B • O • Y • S ~ # ~ # ~ #
+# ~ # ~ # ~ # ~ ~ ~ ~ ~ ~ ~ # ~ # ~ #
+
+summary(model5m <- glm(bmi_group ~ bfq_duration_contrast + age_mos + pds + max_education_category + 
+                         birth_complications +
+                               pregnancy_complications +
+                               mode_of_delivery +
+                               preterm_yes_no +
+                         birthweight_gr,
+                       weights = round(class_weights_m),
+                       family = 'binomial',
+                       data = df.analysis2_m))   # boys
+
+car::vif(model5m)
+
+or_table <- exp(cbind(OR = coef(model5m), confint(model5m)))
+
+print(or_table)
+
+p0 <- mean(df.analysis2_m$bmi_group == "unhealthy")
+
+# Calculate the Relative Risk (RR)
+rr_table <- as.data.frame(or_table)
+rr_table$RR <- rr_table$OR / (1 - p0 + (p0 * rr_table$OR))
+
+print(as.matrix(rr_table))
+
+# Display the Relative Risk (RR%)
+(1 - rr_table$RR[2]) * 100
+(1 - rr_table$RR[3]) * 100
+
+## Accuracy
+
+df.analysis2_m$pred_prob <- predict(model5m, type = "response")
+
+df.analysis2_m$pred_class <- ifelse(df.analysis2_m$pred_prob > 0.5, "unhealthy", "healthy")
+
+accuracy <- mean(df.analysis2_m$pred_class == df.analysis2_m$bmi_group)
+
+print(accuracy)
+
+# ~ # ~ # ~ # ~ ~ ~ ~ ~ ~ ~ ~ ~ # ~ # ~ #
+# ~ # ~ # ~ G • I • R • L • S ~ # ~ # ~ #
+# ~ # ~ # ~ # ~ ~ ~ ~ ~ ~ ~ ~ ~ # ~ # ~ #
+
+summary(model5f <- glm(bmi_group ~ bfq_duration_contrast + age_mos + pds + max_education_category + 
+                         birth_complications +
+                               pregnancy_complications +
+                               mode_of_delivery +
+                               preterm_yes_no +
+                         birthweight_gr, 
+                       weights = round(class_weights_f), 
+                       family = 'binomial', 
+                       data = df.analysis2_f))   # girls
+
+car::vif(model5f)
+
+or_table <- exp(cbind(OR = coef(model5f), confint(model5f)))
+
+print(or_table)
+
+p0 <- mean(df.analysis2_m$bmi_group == "unhealthy")
+
+# Calculate the Relative Risk (RR)
+rr_table <- as.data.frame(or_table)
+rr_table$RR <- rr_table$OR / (1 - p0 + (p0 * rr_table$OR))
+
+print(as.matrix(rr_table))
+
+# Display the Relative Risk (RR%)
+(1 - rr_table$RR[2]) * 100
+(1 - rr_table$RR[3]) * 100
+
+## Accuracy
+
+df.analysis2_f$pred_prob <- predict(model5f, type = "response")
+
+df.analysis2_f$pred_class <- ifelse(df.analysis2_f$pred_prob > 0.5, "unhealthy", "healthy")
+
+accuracy <- mean(df.analysis2_f$pred_class == df.analysis2_f$bmi_group)
+
+print(accuracy)
+
+```
+
+### Plot results
+
+```{R}
+
+preds.all <- ggpredict(model5, 'bfq_duration_contrast')
+
+preds.all$x <- factor(preds.all$x, labels = c('Not breastfed (only formula)', 'Breastfed ≤6 months', 'Breastfed >6 months'))
+
+(a4 <- ggplot(preds.all, aes(x = x, y = predicted, group = group, color = x)) +
+  geom_point(size = 3) +  
+  geom_errorbar(aes(group = group, ymin = conf.low, ymax = conf.high),
+                width = 0.2, 
+                show.legend = F) +  
+  scale_colour_manual(values = c('steelblue', 'orchid', 'darkgreen')) +
+  scale_fill_manual(values = c('steelblue', 'orchid', 'darkgreen')) +
+  scale_y_continuous(limits = c(.35, .85)) +
+  theme_minimal() +
+  theme(legend.title = element_blank(),
+        legend.text = element_text(size = 11),
+        axis.text.x = element_blank(),
+        axis.title = element_blank()))
+
+preds.boys <- ggpredict(model5m, 'bfq_duration_contrast')
+
+preds.boys$x <- factor(preds.boys$x, labels = c('Not breastfed (only formula)', 'Breastfed ≤6 months', 'Breastfed >6 months'))
+
+(b4 <- ggplot(preds.boys, aes(x = x, y = predicted, group = group, color = x)) +
+  geom_point(size = 3) +  
+  geom_errorbar(aes(group = group, ymin = conf.low, ymax = conf.high),
+                width = 0.2, 
+                show.legend = F) +  
+  scale_colour_manual(values = c('steelblue', 'orchid', 'darkgreen')) +
+  scale_fill_manual(values = c('steelblue', 'orchid', 'darkgreen')) +
+  scale_y_continuous(limits = c(.35, .85)) +
+  theme_minimal() +
+ theme(legend.title = element_blank(),
+       legend.text = element_text(size = 11),
+       axis.text = element_blank(),
+       axis.title = element_blank()))
+
+preds.girls <- ggpredict(model5f, 'bfq_duration_contrast')
+
+preds.girls$x <- factor(preds.girls$x, labels = c('Not breastfed (only formula)', 'Breastfed ≤6 months', 'Breastfed >6 months'))
+
+(c4 <- ggplot(preds.girls, aes(x = x, y = predicted, group = group, color = x)) +
+  geom_point(size = 3) +  
+  geom_errorbar(aes(group = group, ymin = conf.low, ymax = conf.high),
+                width = 0.2, 
+                show.legend = F) +  
+  scale_colour_manual(values = c('steelblue', 'orchid', 'darkgreen')) +
+  scale_fill_manual(values = c('steelblue', 'orchid', 'darkgreen')) +
+  scale_y_continuous(limits = c(.35, .85)) +
+  theme_minimal() +
+  theme(legend.title = element_blank(),
+        legend.text = element_text(size = 11),
+        axis.text = element_blank(),
+        axis.title = element_blank()))
+
+(p8 <- ggarrange(a4, b4, c4, ncol = 3, common.legend = T, legend = 'right'))
+
+(p9 <- ggarrange(p7, p8, nrow = 2))
+
+(Fig3 <-  ggpubr::annotate_figure(p9, left = text_grob("Predicted Probability", vjust = 0.5, rot = 90)) + theme(plot.background = element_rect(fill = 'white')))
+
+ggsave('fig3.png', plot = Fig3, width = 4, height = 2.5, unit = 'in', dpi = 300, scale = 2)
+
+```
